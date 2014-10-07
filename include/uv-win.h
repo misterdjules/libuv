@@ -294,6 +294,16 @@ typedef struct uv__dirent_s {
   char d_name[1];
 } uv__dirent_t;
 
+/*
+  * "dirent" is used to hold a buffer large enough for any dirent in the
+  * directory being read. Avoids allocating for each directory entry.
+  */
+#define UV_DIR_PRIVATE_FIELDS \
+  HANDLE dir_handle; \
+  WIN32_FIND_DATAW find_data; \
+  BOOL need_find_call; \
+  uv__dirent_t* dirent;
+
 #define UV__DT_DIR     UV_DIRENT_DIR
 #define UV__DT_FILE    UV_DIRENT_FILE
 #define UV__DT_LINK    UV_DIRENT_LINK

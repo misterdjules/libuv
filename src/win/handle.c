@@ -142,6 +142,10 @@ void uv_close(uv_handle_t* handle, uv_close_cb cb) {
       uv_want_endgame(loop, handle);
       return;
 
+	case UV_DIR:
+	  uv_dir_close(loop, (uv_dir_t*)handle);
+	  return;
+
     default:
       /* Not supported */
       abort();

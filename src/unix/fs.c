@@ -136,6 +136,95 @@ static ssize_t uv__fs_fdatasync(uv_fs_t* req) {
 }
 
 
+static ssize_t uv__fs_clamp_max_path_len(ssize_t len) {
+  if (len == -1) {
+  #if defined(PATH_MAX)
+    len = PATH_MAX;
+  #else
+    len = 4096;
+  #endif
+  }
+
+  return len;
+}
+
+/*
+ * Computes the required size in bytes for directory entries read from the
+ * directory identified by the handle "dir".
+ *
+ * This code does not trust values of NAME_MAX that are less than
+ * 255, since some systems (including at least HP-UX) incorrectly
+ * define it to be a smaller value.
+ *
+ * This code was copied from
+ * http://womble.decadent.org.uk/readdir_r-advisory.html
+ * and slightly adapted.
+ */
+static size_t uv__fs_direntry_size(const DIR* dir) {
+  long name_max;
+  size_t name_end;
+
+  name_max = -1;
+  name_end = -1;
+
+#if defined(HAVE_FPATHCONF) && defined(HAVE_DIRFD) \
+    && defined(_PC_NAME_MAX)
+  name_max = fpathconf(dirfd(dirp), _PC_NAME_MAX);
+  if (name_max == -1)
+#   if defined(NAME_MAX)
+      name_max = (NAME_MAX > 255) ? NAME_MAX : 255;
+#   else
+      return (size_t)(-1);
+#   endif /* defined(NAME_MAX)
+#else
+# if defined(NAME_MAX)
+    name_max = (NAME_MAX > 255) ? NAME_MAX : 255;
+# else
+#   error "buffer size for readdir_r cannot be determined"
+# endif /* defined(NAME_MAX) */
+#endif
+
+  /*
+   * Most of the time, struct dirent is defined by operating systems' header
+   * files as either one of the following possible implementations:
+   * 1)
+   *
+   * struct dirent {
+   *   char d_name[ NAME_MAX + 1 ];
+   *   other stuff;
+   * };
+   *
+   * 2)
+   *
+   * struct dirent {
+   *   char d_name[1];
+   *   other stuff;
+   * };
+   *
+   * In case 1, using sizeof(struct dirent) to compute the size for the buffer
+   * would account for the path name. In case 2), it would not.
+   *
+   * The following test ensures that this function always allocate enough
+   * memory to hold the longest path names that can exist for a given
+   * directory, regardless of how system headers implement struct dirent.
+   */
+  name_end = (size_t)offsetof(struct dirent, d_name) + name_max + 1;
+  if (name_end > sizeof(struct dirent))
+    return name_end;
+  return sizeof(struct dirent);
+}
+
+static ssize_t uv__fs_max_path_len(const char* path) {
+  ssize_t len;
+
+  assert(path);
+
+  len = pathconf(path, _PC_PATH_MAX);
+  len = uv__fs_clamp_max_path_len(len);
+
+  return len;
+}
+
 static ssize_t uv__fs_futime(uv_fs_t* req) {
 #if defined(__linux__)
   /* utimesat() has nanosecond resolution but we stick to microseconds
@@ -339,21 +428,74 @@ out:
   return n;
 }
 
+static int uv__fs_opendir(uv_fs_t* req) {
+  DIR *dir;
+  size_t len;
+
+  assert(req && req->dir_handle);
+
+  dir = opendir(req->path);
+  if (dir == NULL)
+    return -1;
+
+  len = uv__fs_direntry_size(dir);
+  if (len == (size_t)-1)
+    return -1;
+
+  /*
+   * Allocate the space for each directory entry just once instead of
+   * once per directory entry.
+   */
+  req->dir_handle->dirent = malloc(len + 1);
+  if (req->dir_handle->dirent == NULL) {
+    errno = ENOMEM;
+    return -1;
+  }
+
+  req->dir_handle->dir = dir;
+  req->ptr = req->dir_handle;
+
+  return 0;
+}
+
+static int uv__fs_readdir(uv_fs_t* req) {
+  struct dirent *de;
+  int r;
+
+  assert(req);
+  assert(req->dir_handle);
+  assert(req->dir_handle->dirent);
+  assert(req->dir_entry);
+
+  req->ptr = req->dir_entry;
+
+  de = NULL;
+
+  r = readdir_r(req->dir_handle->dir, req->dir_handle->dirent, &de);
+
+  if (r == 0) {
+    if (de != NULL) {
+      req->dir_entry->name = strdup(de->d_name);
+      if (req->dir_entry->name != NULL) {
+        req->dir_entry->type = uv__fs_get_dirent_type(de);
+        r = 1;
+      } else {
+        errno = ENOMEM;
+        r = -1;
+      }
+    } else {
+      r = UV_EOF;
+    }
+  }
+
+  return r;
+}
 
 static ssize_t uv__fs_readlink(uv_fs_t* req) {
   ssize_t len;
   char* buf;
 
-  len = pathconf(req->path, _PC_PATH_MAX);
-
-  if (len == -1) {
-#if defined(PATH_MAX)
-    len = PATH_MAX;
-#else
-    len = 4096;
-#endif
-  }
-
+  len = uv__fs_max_path_len(req->path);
   buf = malloc(len + 1);
 
   if (buf == NULL) {
@@ -779,6 +921,8 @@ static void uv__fs_work(struct uv__work* w) {
     X(MKDTEMP, uv__fs_mkdtemp(req));
     X(READ, uv__fs_read(req));
     X(SCANDIR, uv__fs_scandir(req));
+    X(OPENDIR, uv__fs_opendir(req));
+    X(READDIR, uv__fs_readdir(req));
     X(READLINK, uv__fs_readlink(req));
     X(RENAME, rename(req->path, req->new_path));
     X(RMDIR, rmdir(req->path));
@@ -1050,6 +1194,54 @@ int uv_fs_scandir(uv_loop_t* loop,
   POST;
 }
 
+int uv_fs_opendir(uv_loop_t* loop,
+                  uv_fs_t* req,
+                  uv_dir_t* dirh,
+                  const char* path,
+                  int flags,
+                  uv_fs_cb cb) {
+
+  INIT(OPENDIR);
+  PATH;
+
+  uv__handle_init(loop, dirh, UV_DIR);
+  uv__handle_start(dirh);
+
+  dirh->dir_flags = flags;
+
+  dirh->dir = NULL;
+  req->dir_handle = dirh;
+
+  POST;
+}
+
+void uv__dir_close(uv_dir_t* dirh) {
+  if (!uv__is_active(dirh))
+    return;
+
+  if (dirh->dir) {
+    closedir(dirh->dir);
+    dirh->dir = NULL;
+  }
+
+  if (dirh->dirent) {
+    free(dirh->dirent);
+    dirh->dirent = NULL;
+  }
+}
+
+int uv_fs_readdir(uv_loop_t* loop,
+                  uv_fs_t* req,
+                  uv_dir_t* dirh,
+                  uv_dirent_t* dirent,
+                  uv_fs_cb cb) {
+  INIT(READDIR);
+
+  req->dir_handle = dirh;
+  req->dir_entry = dirent;
+
+  POST;
+}
 
 int uv_fs_readlink(uv_loop_t* loop,
                    uv_fs_t* req,
@@ -1169,7 +1361,12 @@ void uv_fs_req_cleanup(uv_fs_t* req) {
   if (req->fs_type == UV_FS_SCANDIR && req->ptr != NULL)
     uv__fs_scandir_cleanup(req);
 
-  if (req->ptr != &req->statbuf)
+  if (req->fs_type == UV_FS_READDIR)
+    uv__fs_readdir_cleanup(req);
+
+  if (req->fs_type != UV_FS_READDIR &&
+      req->fs_type != UV_FS_OPENDIR &&
+      req->ptr != &req->statbuf)
     free(req->ptr);
   req->ptr = NULL;
 }

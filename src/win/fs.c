@@ -903,6 +903,123 @@ fatal:
   free(dents);
 }
 
+void fs__opendir(uv_fs_t* req) {
+  WCHAR* pathw = req->pathw;
+  size_t len = wcslen(pathw);
+  HANDLE dir;
+  WIN32_FIND_DATAW ent = { 0 };
+  WCHAR* path2;
+  const WCHAR* fmt;
+
+  if (len == 0) {
+    fmt = L"./*";
+  } else if (pathw[len - 1] == L'/' || pathw[len - 1] == L'\\') {
+    fmt = L"%s*";
+  } else {
+    fmt = L"%s\\*";
+  }
+
+  /* Figure out whether path is a file or a directory. */
+  if (!(GetFileAttributesW(pathw) & FILE_ATTRIBUTE_DIRECTORY)) {
+    req->result = UV_ENOTDIR;
+    req->sys_errno_ = ERROR_SUCCESS;
+    return;
+  }
+
+  path2 = (WCHAR*)malloc(sizeof(WCHAR) * (len + 4));
+  if (!path2) {
+    SET_REQ_UV_ERROR(req, UV_ENOMEM, ERROR_OUTOFMEMORY);
+    return;
+  }
+
+  _snwprintf(path2, len + 3, fmt, pathw);
+  dir = FindFirstFileW(path2, &req->dir_handle->find_data);
+  free(path2);
+
+  if(dir == INVALID_HANDLE_VALUE) {
+    SET_REQ_WIN32_ERROR(req, GetLastError());
+    return;
+  }
+
+  req->dir_handle->dir_handle = dir;
+  req->dir_handle->need_find_call = FALSE;
+  req->result = 0;
+  req->ptr = req->dir_handle;
+}
+
+void fs__readdir(uv_fs_t* req) {
+  uv__dirent_t* dent = NULL;
+  int utf8_len;
+  size_t len;
+  WCHAR* name = NULL;
+  uv_dir_t* dir_handle = NULL;
+  PWIN32_FIND_DATAW find_data = NULL;
+
+  assert(req);
+  if (req)
+    dir_handle = req->dir_handle;
+
+  assert(dir_handle);
+  if (dir_handle)
+    find_data = &dir_handle->find_data;
+
+  if (dir_handle->need_find_call) {
+    if (!FindNextFileW(dir_handle->dir_handle, find_data)) {
+      req->result = UV_EOF;
+      return;
+    }
+  }
+
+  name = find_data->cFileName;
+
+  /* Allocate enough space to fit utf8 encoding of file name */
+  len = wcslen(name);
+  utf8_len = uv_utf16_to_utf8(name, len, NULL, 0);
+  if (!utf8_len) {
+    SET_REQ_WIN32_ERROR(req, GetLastError());
+    goto fatal;
+  }
+
+  dent = malloc(sizeof(*dent) + utf8_len + 1);
+  if (dent == NULL) {
+    SET_REQ_UV_ERROR(req, UV_ENOMEM, ERROR_OUTOFMEMORY);
+    goto fatal;
+  }
+
+  /* Copy file name */
+  utf8_len = uv_utf16_to_utf8(name, len, dent->d_name, utf8_len);
+  if (!utf8_len) {
+    free(dent);
+    SET_REQ_WIN32_ERROR(req, GetLastError());
+    goto fatal;
+  }
+  dent->d_name[utf8_len] = '\0';
+
+  /* Copy file type */
+  if ((find_data->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+    dent->d_type = UV__DT_DIR;
+  else if ((find_data->dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+    dent->d_type = UV__DT_LINK;
+  else
+    dent->d_type = UV__DT_FILE;
+
+  req->dir_entry->name = strdup(dent->d_name);
+  if (!req->dir_entry->name) {
+	SET_REQ_UV_ERROR(req, UV_ENOMEM, ERROR_OUTOFMEMORY);
+    goto fatal;
+  }
+
+  req->dir_entry->type = uv__fs_get_dirent_type(dent);
+
+  req->dir_handle->need_find_call = TRUE;
+  req->result = 1;
+  req->ptr = req->dir_entry;
+
+fatal:
+  if (dent)
+    free(dent);
+  dent = NULL;
+}
 
 INLINE static int fs__stat_handle(HANDLE handle, uv_stat_t* statbuf) {
   FILE_ALL_INFORMATION file_info;
@@ -1605,6 +1722,8 @@ static void uv__fs_work(struct uv__work* w) {
     XX(MKDTEMP, mkdtemp)
     XX(RENAME, rename)
     XX(SCANDIR, scandir)
+    XX(READDIR, readdir)
+    XX(OPENDIR, opendir)
     XX(LINK, link)
     XX(SYMLINK, symlink)
     XX(READLINK, readlink)
@@ -1641,6 +1760,9 @@ void uv_fs_req_cleanup(uv_fs_t* req) {
 
   if (req->flags & UV_FS_FREE_PTR)
     free(req->ptr);
+
+  if (req->fs_type == UV_FS_READDIR)
+    uv__fs_readdir_cleanup(req);
 
   req->path = NULL;
   req->pathw = NULL;
@@ -1861,6 +1983,72 @@ int uv_fs_scandir(uv_loop_t* loop, uv_fs_t* req, const char* path, int flags,
   }
 }
 
+int uv_fs_opendir(uv_loop_t* loop,
+                  uv_fs_t* req,
+                  uv_dir_t* dirh,
+                  const char* path,
+                  int flags,
+                  uv_fs_cb cb) {
+  int err;
+
+  uv_fs_req_init(loop, req, UV_FS_OPENDIR, cb);
+
+  uv__handle_init(loop, dirh, UV_DIR);
+  uv__handle_start(dirh);
+
+  err = fs__capture_path(loop, req, path, NULL, cb != NULL);
+  if (err) {
+    return uv_translate_sys_error(err);
+  }
+
+  dirh->dir_flags = flags;
+  req->dir_handle = dirh;
+
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__opendir(req);
+    return req->result;
+  }
+}
+
+UV_EXTERN int uv_fs_readdir(uv_loop_t* loop,
+                            uv_fs_t* req,
+                            uv_dir_t* dirh,
+                            uv_dirent_t* dirent,
+                            uv_fs_cb cb) {
+  uv_fs_req_init(loop, req, UV_FS_READDIR, cb);
+
+  req->dir_handle = dirh;
+  req->dir_entry = dirent;
+
+  if (cb) {
+    QUEUE_FS_TP_JOB(loop, req);
+    return 0;
+  } else {
+    fs__readdir(req);
+    return req->result;
+  }
+}
+
+void uv_dir_cleanup(uv_loop_t* loop, uv_dir_t* handle) {
+  FindClose(handle->dir_handle);
+}
+
+void uv_dir_close(uv_loop_t* loop, uv_dir_t* handle) {
+  uv__handle_closing(handle);
+
+  uv_dir_cleanup(loop, handle);
+
+  uv_want_endgame(loop, (uv_handle_t*)handle);
+}
+
+void uv__fs_dir_endgame(uv_loop_t* loop, uv_dir_t* handle) {
+  assert(handle->flags & UV__HANDLE_CLOSING);
+  assert(!(handle->flags & UV_HANDLE_CLOSED));
+  uv__handle_close(handle);
+}
 
 int uv_fs_link(uv_loop_t* loop, uv_fs_t* req, const char* path,
     const char* new_path, uv_fs_cb cb) {

@@ -155,6 +155,10 @@ INLINE static void uv_process_endgames(uv_loop_t* loop) {
         uv__fs_poll_endgame(loop, (uv_fs_poll_t*) handle);
         break;
 
+      case UV_DIR:
+        uv__fs_dir_endgame(loop, (uv_dir_t*)handle);
+        break;
+
       default:
         assert(0);
         break;

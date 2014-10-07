@@ -300,7 +300,8 @@ int uv_translate_sys_error(int sys_errno);
  * FS
  */
 void uv_fs_init();
-
+void uv__fs_dir_endgame(uv_loop_t* loop, uv_dir_t* handle);
+void uv_dir_close(uv_loop_t* loop, uv_dir_t* handle);
 
 /*
  * FS Event

@@ -156,6 +156,10 @@ void uv_close(uv_handle_t* handle, uv_close_cb close_cb) {
     /* itself close uv__make_close_pending whenever appropriate. */
     return;
 
+  case UV_DIR:
+    uv__dir_close((uv_dir_t*)handle);
+    break;
+
   default:
     assert(0);
   }
@@ -221,6 +225,7 @@ static void uv__finish_close(uv_handle_t* handle) {
     case UV_FS_POLL:
     case UV_POLL:
     case UV_SIGNAL:
+    case UV_DIR:
       break;
 
     case UV_NAMED_PIPE:
